@@ -1,6 +1,6 @@
 import java.io.ByteArrayOutputStream
 
-val version = "2.10.0"
+val version = "2.11.1"
 val suffix = "SNAPSHOT"
 
 // Strings embedded into the build.
@@ -55,7 +55,6 @@ if ("release" !in gradle.startParameter.taskNames) {
 }
 
 plugins {
-    alias(libs.plugins.shadow)
     `java-library`
     `maven-publish`
     signing
@@ -84,7 +83,7 @@ subprojects {
         targetCompatibility = JavaVersion.VERSION_1_8
     }
 
-    val mavenProjects = arrayOf("apktool-lib", "apktool-cli", "brut.j.common", "brut.j.util", "brut.j.dir")
+    val mavenProjects = arrayOf("brut.j.common", "brut.j.util", "brut.j.dir", "brut.j.xml", "apktool-lib", "apktool-cli")
 
     if (project.name in mavenProjects) {
         apply(plugin = "maven-publish")
@@ -159,8 +158,10 @@ subprojects {
     }
 }
 
-// Used for official releases.
 task("release") {
-    dependsOn("build")
-    finalizedBy("publish")
+  // Used for official releases.
+}
+
+tasks.wrapper {
+    distributionType = Wrapper.DistributionType.ALL
 }

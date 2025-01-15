@@ -3,9 +3,8 @@ val apktoolVersion: String by rootProject.extra
 
 tasks {
     processResources {
-        from("src/main/resources/properties") {
-            include("**/*.properties")
-            into("properties")
+        from("src/main/resources") {
+            include("apktool.properties")
             expand("version" to apktoolVersion, "gitrev" to gitRevision)
             duplicatesStrategy = DuplicatesStrategy.INCLUDE
         }
@@ -25,13 +24,13 @@ tasks {
 }
 
 dependencies {
-    api(project(":brut.j.dir"))
-    api(project(":brut.j.util"))
     api(project(":brut.j.common"))
+    api(project(":brut.j.util"))
+    api(project(":brut.j.dir"))
+    api(project(":brut.j.xml"))
 
     implementation(libs.baksmali)
     implementation(libs.smali)
-    implementation(libs.xmlpull)
     implementation(libs.guava)
     implementation(libs.commons.lang3)
     implementation(libs.commons.io)

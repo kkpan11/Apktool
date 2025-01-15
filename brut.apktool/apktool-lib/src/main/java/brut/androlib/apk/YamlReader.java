@@ -22,9 +22,8 @@ import java.io.InputStream;
 import java.util.*;
 
 public class YamlReader {
-
     private ArrayList<YamlLine> mLines;
-    private int mCurrent = 0;
+    private int mCurrent;
 
     public YamlReader(InputStream in) {
         mLines = new ArrayList<>();
@@ -203,12 +202,21 @@ public class YamlReader {
         readList(list, (items, reader) -> items.add(reader.getLine().getValueInt()));
     }
 
-    public void readMap(Map<String, String> map) throws AndrolibException {
+    public void readStringMap(Map<String, String> map) throws AndrolibException {
         readObject(map,
             line -> line.hasColon,
             (items, reader) -> {
                 YamlLine line = reader.getLine();
                 items.put(line.getKey(), line.getValue());
+            });
+    }
+
+    public void readBoolMap(Map<String, Boolean> map) throws AndrolibException {
+        readObject(map,
+            line -> line.hasColon,
+            (items, reader) -> {
+                YamlLine line = reader.getLine();
+                items.put(line.getKey(), line.getValueBool());
             });
     }
 }

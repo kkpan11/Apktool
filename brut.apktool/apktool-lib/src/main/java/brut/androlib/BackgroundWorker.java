@@ -17,15 +17,18 @@
 package brut.androlib;
 
 import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.*;
 
 public class BackgroundWorker {
-    private final ArrayList<Future<?>> mWorkerFutures = new ArrayList<>();
     private final ExecutorService mExecutor;
-    private volatile boolean mSubmitAllowed = true;
+    private final List<Future<?>> mWorkerFutures;
+    private volatile boolean mSubmitAllowed;
 
     public BackgroundWorker(int threads) {
         mExecutor = Executors.newFixedThreadPool(threads);
+        mWorkerFutures = new ArrayList<>();
+        mSubmitAllowed = true;
     }
 
     public void waitForFinish() {
@@ -34,8 +37,8 @@ public class BackgroundWorker {
         for (Future<?> future : mWorkerFutures) {
             try {
                 future.get();
-            } catch (InterruptedException | ExecutionException e) {
-                throw new RuntimeException(e);
+            } catch (InterruptedException | ExecutionException ex) {
+                throw new RuntimeException(ex);
             }
         }
         mWorkerFutures.clear();

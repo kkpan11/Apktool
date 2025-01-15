@@ -21,10 +21,10 @@ import java.nio.charset.StandardCharsets;
 import java.util.*;
 
 public class YamlWriter implements Closeable {
+    private static final String QUOTE = "'";
 
-    private int mIndent = 0;
     private final PrintWriter mWriter;
-    private final String QUOTE = "'";
+    private int mIndent;
 
     public YamlWriter(OutputStream out) {
         mWriter = new PrintWriter(new BufferedWriter(
@@ -89,21 +89,21 @@ public class YamlWriter implements Closeable {
         }
         writeIndent();
         mWriter.println(escape(key) + ":");
-        for (T item: list) {
+        for (T item : list) {
             writeIndent();
-            mWriter.println("- " +  item);
+            mWriter.println("- " + item);
         }
     }
 
-    public void writeStringMap(String key, Map<String, String> map) {
+    public <T> void writeMap(String key, Map<String, T> map) {
         if (Objects.isNull(map)) {
             return;
         }
         writeIndent();
         mWriter.println(escape(key) + ":");
         nextIndent();
-        for (String mapKey: map.keySet()) {
-            writeString(mapKey, map.get(mapKey));
+        for (String mapKey : map.keySet()) {
+            writeString(mapKey, String.valueOf(map.get(mapKey)));
         }
         prevIndent();
     }

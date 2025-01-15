@@ -17,13 +17,14 @@
 package brut.androlib.res.decoder;
 
 import android.util.TypedValue;
+import brut.androlib.Config;
+import brut.androlib.apk.ApkInfo;
 import brut.androlib.exceptions.AndrolibException;
 import brut.androlib.res.data.*;
 import brut.androlib.res.data.arsc.*;
 import brut.androlib.res.data.value.*;
-import brut.util.Duo;
-import brut.util.ExtCountingDataInput;
-import com.google.common.io.LittleEndianDataInputStream;
+import brut.util.ExtDataInputStream;
+import org.apache.commons.lang3.tuple.Pair;
 
 import java.io.*;
 import java.math.BigInteger;
@@ -31,38 +32,60 @@ import java.util.*;
 import java.util.logging.Logger;
 
 public class ARSCDecoder {
-    public static ARSCData decode(InputStream arscStream, boolean findFlagsOffsets, boolean keepBroken)
-            throws AndrolibException {
-        return decode(arscStream, findFlagsOffsets, keepBroken, new ResTable());
+    private static final Logger LOGGER = Logger.getLogger(ARSCDecoder.class.getName());
+
+    private static final short ENTRY_FLAG_COMPLEX = 0x0001;
+    private static final short ENTRY_FLAG_PUBLIC = 0x0002;
+    private static final short ENTRY_FLAG_WEAK = 0x0004;
+    private static final short ENTRY_FLAG_COMPACT = 0x0008;
+
+    private static final short TABLE_TYPE_FLAG_SPARSE = 0x01;
+    private static final short TABLE_TYPE_FLAG_OFFSET16 = 0x02;
+
+    private static final int KNOWN_CONFIG_BYTES = 64;
+
+    private static final int NO_ENTRY = 0xFFFFFFFF;
+    private static final int NO_ENTRY_OFFSET16 = 0xFFFF;
+
+    private final ExtDataInputStream mIn;
+    private final ResTable mResTable;
+    private final List<FlagsOffset> mFlagsOffsets;
+    private final boolean mKeepBroken;
+    private final Config mConfig;
+    private final HashMap<Integer, Integer> mMissingResSpecMap;
+    private final HashMap<Integer, ResTypeSpec> mResTypeSpecs;
+
+    private ARSCHeader mHeader;
+    private StringBlock mTableStrings;
+    private StringBlock mTypeNames;
+    private StringBlock mSpecNames;
+    private ResPackage mPkg;
+    private ResTypeSpec mTypeSpec;
+    private ResType mType;
+    private int mResId;
+    private int mTypeIdOffset;
+
+    public ARSCDecoder(InputStream in, ResTable resTable, boolean storeFlagsOffsets, boolean keepBroken) {
+        mIn = ExtDataInputStream.littleEndian(in);
+        mResTable = resTable;
+        mFlagsOffsets = storeFlagsOffsets ? new ArrayList<>() : null;
+        mKeepBroken = keepBroken;
+        mConfig = resTable.getConfig();
+        mMissingResSpecMap = new LinkedHashMap<>();
+        mResTypeSpecs = new HashMap<>();
     }
 
-    public static ARSCData decode(InputStream arscStream, boolean findFlagsOffsets, boolean keepBroken,
-                                  ResTable resTable)
-            throws AndrolibException {
+    public ARSCData decode() throws AndrolibException {
         try {
-            ARSCDecoder decoder = new ARSCDecoder(arscStream, resTable, findFlagsOffsets, keepBroken);
-            ResPackage[] pkgs = decoder.readResourceTable();
-            return new ARSCData(pkgs, decoder.mFlagsOffsets == null
-                    ? null
-                    : decoder.mFlagsOffsets.toArray(new FlagsOffset[0]));
+            ResPackage[] pkgs = readResourceTable();
+            FlagsOffset[] flagsOffsets = mFlagsOffsets != null ? mFlagsOffsets.toArray(new FlagsOffset[0]) : null;
+            return new ARSCData(pkgs, flagsOffsets);
         } catch (IOException ex) {
             throw new AndrolibException("Could not decode arsc file", ex);
         }
     }
 
-    private ARSCDecoder(InputStream arscStream, ResTable resTable, boolean storeFlagsOffsets, boolean keepBroken) {
-        if (storeFlagsOffsets) {
-            mFlagsOffsets = new ArrayList<>();
-        } else {
-            mFlagsOffsets = null;
-        }
-        mIn = new ExtCountingDataInput(new LittleEndianDataInputStream(arscStream));
-        mResTable = resTable;
-        mKeepBroken = keepBroken;
-        mMissingResSpecMap = new LinkedHashMap<>();
-    }
-
-    private ResPackage[] readResourceTable() throws IOException, AndrolibException {
+    private ResPackage[] readResourceTable() throws AndrolibException, IOException {
         Set<ResPackage> pkgs = new LinkedHashSet<>();
         ResTypeSpec typeSpec;
         int chunkNumber = 1;
@@ -119,26 +142,27 @@ public class ARSCDecoder {
             }
         }
 
-        if (mResTable.getConfig().isDecodeResolveModeUsingDummies() && mPkg != null && mPkg.getResSpecCount() > 0) {
+        if (mConfig.getDecodeResolveMode() == Config.DECODE_RES_RESOLVE_DUMMY
+                && mPkg != null && mPkg.getResSpecCount() > 0) {
             addMissingResSpecs();
         }
 
         return pkgs.toArray(new ResPackage[0]);
     }
 
-    private void readStringPoolChunk() throws IOException, AndrolibException {
+    private void readStringPoolChunk() throws AndrolibException, IOException {
         checkChunkType(ARSCHeader.RES_STRING_POOL_TYPE);
         mTableStrings = StringBlock.readWithoutChunk(mIn, mHeader.startPosition, mHeader.headerSize, mHeader.chunkSize);
     }
 
-    private void readTableChunk() throws IOException, AndrolibException {
+    private void readTableChunk() throws AndrolibException, IOException {
         checkChunkType(ARSCHeader.RES_TABLE_TYPE);
         mIn.skipInt(); // packageCount
 
         mHeader.checkForUnreadHeader(mIn);
     }
 
-    private void readUnknownChunk() throws IOException, AndrolibException {
+    private void readUnknownChunk() throws AndrolibException, IOException {
         checkChunkType(ARSCHeader.RES_NULL_TYPE);
 
         mHeader.checkForUnreadHeader(mIn);
@@ -147,7 +171,7 @@ public class ARSCDecoder {
         mHeader.skipChunk(mIn);
     }
 
-    private ResPackage readTablePackage() throws IOException, AndrolibException {
+    private ResPackage readTablePackage() throws AndrolibException, IOException {
         checkChunkType(ARSCHeader.XML_TYPE_PACKAGE);
         int id = mIn.readInt();
 
@@ -170,7 +194,7 @@ public class ARSCDecoder {
 
         // TypeIdOffset was added platform_frameworks_base/@f90f2f8dc36e7243b85e0b6a7fd5a590893c827e
         // which is only in split/new applications.
-        int splitHeaderSize = (2 + 2 + 4 + 4 + (2 * 128) + (4 * 5)); // short, short, int, int, char[128], int * 4
+        int splitHeaderSize = 2 + 2 + 4 + 4 + (2 * 128) + (4 * 5); // short, short, int, int, char[128], int * 4
         if (mHeader.headerSize == splitHeaderSize) {
             mTypeIdOffset = mIn.readInt();
         }
@@ -246,7 +270,7 @@ public class ARSCDecoder {
         int entryCount = mIn.readInt();
 
         if (mFlagsOffsets != null) {
-            mFlagsOffsets.add(new FlagsOffset(mIn.position(), entryCount));
+            mFlagsOffsets.add(new FlagsOffset((int) mIn.position(), entryCount));
         }
 
         mHeader.checkForUnreadHeader(mIn);
@@ -258,7 +282,7 @@ public class ARSCDecoder {
         return mTypeSpec;
     }
 
-    private ResType readTableType() throws IOException, AndrolibException {
+    private ResType readTableType() throws AndrolibException, IOException {
         checkChunkType(ARSCHeader.XML_TYPE_TYPE);
         int typeId = mIn.readUnsignedByte() - mTypeIdOffset;
 
@@ -301,7 +325,7 @@ public class ARSCDecoder {
             }
         }
 
-        if (flags.isInvalid) {
+        if (flags.isInvalid()) {
             String resName = mTypeSpec.getName() + flags.getQualifiers();
             if (mKeepBroken) {
                 LOGGER.warning("Invalid config flags detected: " + resName);
@@ -310,14 +334,14 @@ public class ARSCDecoder {
             }
         }
 
-        mType = flags.isInvalid && !mKeepBroken ? null : mPkg.getOrCreateConfig(flags);
+        mType = !flags.isInvalid() || mKeepBroken ? mPkg.getOrCreateConfig(flags) : null;
         int noEntry = isOffset16 ? NO_ENTRY_OFFSET16 : NO_ENTRY;
 
         // #3428 - In some applications the res entries are padded for alignment.
-        int entriesStartAligned = mHeader.startPosition + entriesStart;
+        long entriesStartAligned = mHeader.startPosition + entriesStart;
         if (mIn.position() < entriesStartAligned) {
             long bytesSkipped = mIn.skip(entriesStartAligned - mIn.position());
-            LOGGER.fine("Skipping: " + bytesSkipped + " byte(s) to align with ResTable_entry start.");
+            LOGGER.fine(String.format("Skipping: %d byte(s) to align with ResTable_entry start.", bytesSkipped));
         }
 
         for (int i : entryOffsetMap.keySet()) {
@@ -354,20 +378,22 @@ public class ARSCDecoder {
         return mType;
     }
 
-    private EntryData readEntryData() throws IOException, AndrolibException {
-        short size = mIn.readShort();
+    private EntryData readEntryData() throws AndrolibException, IOException {
+        int size = mIn.readUnsignedShort();
         short flags = mIn.readShort();
 
         boolean isComplex = (flags & ENTRY_FLAG_COMPLEX) != 0;
         boolean isCompact = (flags & ENTRY_FLAG_COMPACT) != 0;
 
-        if (size < 0 && !isCompact) {
-            throw new AndrolibException("Entry size is under 0 bytes and not compactly packed.");
-        }
-
         int specNamesId = mIn.readInt();
         if (specNamesId == NO_ENTRY && !isCompact) {
             return null;
+        }
+
+        // Be sure we don't poison mResTable by marking the application as compact
+        // Only flag the ResTable as compact if the main package is not loaded.
+        if (isCompact && !mResTable.isMainPkgLoaded()) {
+            mResTable.setCompactEntries(true);
         }
 
         // #3366 - In a compactly packed entry, the key index is the size & type is higher 8 bits on flags.
@@ -377,7 +403,7 @@ public class ARSCDecoder {
             byte type = (byte) ((flags >> 8) & 0xFF);
             value = readCompactValue(type, specNamesId);
 
-            // To keep code below happy - we know if compact that the size has the key index encoded.
+            // To keep code below happy - we know if compact then the size has the key index encoded.
             specNamesId = size;
         } else if (isComplex) {
             value = readComplexEntry();
@@ -392,15 +418,15 @@ public class ARSCDecoder {
         }
 
         EntryData entryData = new EntryData();
-        entryData.mFlags = flags;
-        entryData.mSpecNamesId = specNamesId;
-        entryData.mValue = value;
+        entryData.flags = flags;
+        entryData.specNamesId = specNamesId;
+        entryData.value = value;
         return entryData;
     }
 
     private void readEntry(EntryData entryData) throws AndrolibException {
-        int specNamesId = entryData.mSpecNamesId;
-        ResValue value = entryData.mValue;
+        int specNamesId = entryData.specNamesId;
+        ResValue value = entryData.value;
 
         if (mTypeSpec.isString() && value instanceof ResFileValue) {
             value = new ResStringValue(value.toString(), ((ResFileValue) value).getRawIntValue());
@@ -434,12 +460,12 @@ public class ARSCDecoder {
         }
     }
 
-    private ResBagValue readComplexEntry() throws IOException, AndrolibException {
-        int parent = mIn.readInt();
+    private ResBagValue readComplexEntry() throws AndrolibException, IOException {
+        int parentId = mIn.readInt();
         int count = mIn.readInt();
 
         ResValueFactory factory = mPkg.getValueFactory();
-        Duo<Integer, ResScalarValue>[] items = new Duo[count];
+        Pair<Integer, ResScalarValue>[] items = new Pair[count];
         ResIntBasedValue resValue;
         int resId;
 
@@ -456,10 +482,10 @@ public class ARSCDecoder {
             if (!(resValue instanceof ResScalarValue)) {
                 resValue = new ResStringValue(resValue.toString(), resValue.getRawIntValue());
             }
-            items[i] = new Duo<>(resId, (ResScalarValue) resValue);
+            items[i] = Pair.of(resId, (ResScalarValue) resValue);
         }
 
-        return factory.bagFactory(parent, items, mTypeSpec);
+        return factory.bagFactory(parentId, items, mTypeSpec);
     }
 
     private ResIntBasedValue readCompactValue(byte type, int data) throws AndrolibException {
@@ -468,22 +494,22 @@ public class ARSCDecoder {
             : mPkg.getValueFactory().factory(type, data, null);
     }
 
-    private ResIntBasedValue readValue() throws IOException, AndrolibException {
-		int size = mIn.readShort();
+    private ResIntBasedValue readValue() throws AndrolibException, IOException {
+        short size = mIn.readShort();
         if (size < 8) {
             return null;
         }
 
-		mIn.skipCheckByte((byte) 0); // zero
+        mIn.skipCheckByte((byte) 0); // zero
         byte type = mIn.readByte();
         int data = mIn.readInt();
 
         return type == TypedValue.TYPE_STRING
-                ? mPkg.getValueFactory().factory(mTableStrings.getHTML(data), data)
-                : mPkg.getValueFactory().factory(type, data, null);
+            ? mPkg.getValueFactory().factory(mTableStrings.getHTML(data), data)
+            : mPkg.getValueFactory().factory(type, data, null);
     }
 
-    private ResConfigFlags readConfigFlags() throws IOException, AndrolibException {
+    private ResConfigFlags readConfigFlags() throws AndrolibException, IOException {
         int size = mIn.readInt();
         int read = 8;
 
@@ -499,8 +525,8 @@ public class ARSCDecoder {
         char[] language = new char[0];
         char[] country = new char[0];
         if (size >= 12) {
-            language = this.unpackLanguageOrRegion(mIn.readByte(), mIn.readByte(), 'a');
-            country = this.unpackLanguageOrRegion(mIn.readByte(), mIn.readByte(), '0');
+            language = unpackLanguageOrRegion(mIn.readByte(), mIn.readByte(), 'a');
+            country = unpackLanguageOrRegion(mIn.readByte(), mIn.readByte(), '0');
             read = 12;
         }
 
@@ -612,7 +638,7 @@ public class ARSCDecoder {
                 inputFlags, grammaticalInflection, screenWidth, screenHeight, sdkVersion,
                 screenLayout, uiMode, smallestScreenWidthDp, screenWidthDp,
                 screenHeightDp, localeScript, localeVariant, screenLayout2,
-                colorMode, localeNumberingSystem, isInvalid, size);
+                colorMode, localeNumberingSystem, size, isInvalid);
     }
 
     private char[] unpackLanguageOrRegion(byte in0, byte in1, char base) {
@@ -655,8 +681,8 @@ public class ARSCDecoder {
             ResID id = new ResID(resId);
             ResResSpec spec = new ResResSpec(id, resName, mPkg, mResTypeSpecs.get(typeId));
 
-            // If we already have this resID don't add it again.
-            if (! mPkg.hasResSpec(id)) {
+            // If we already have this resId don't add it again.
+            if (!mPkg.hasResSpec(id)) {
                 mPkg.addResSpec(spec);
                 spec.getType().addResSpec(spec);
                 ResType resType = mPkg.getOrCreateConfig(new ResConfigFlags());
@@ -682,36 +708,4 @@ public class ARSCDecoder {
                     expectedType, mHeader.type));
         }
     }
-
-    private final ExtCountingDataInput mIn;
-    private final ResTable mResTable;
-    private final List<FlagsOffset> mFlagsOffsets;
-    private final boolean mKeepBroken;
-
-    private ARSCHeader mHeader;
-    private StringBlock mTableStrings;
-    private StringBlock mTypeNames;
-    private StringBlock mSpecNames;
-    private ResPackage mPkg;
-    private ResTypeSpec mTypeSpec;
-    private ResType mType;
-    private int mResId;
-    private int mTypeIdOffset = 0;
-    private final HashMap<Integer, Integer> mMissingResSpecMap;
-    private final HashMap<Integer, ResTypeSpec> mResTypeSpecs = new HashMap<>();
-
-    private final static short ENTRY_FLAG_COMPLEX = 0x0001;
-    private final static short ENTRY_FLAG_PUBLIC = 0x0002;
-    private final static short ENTRY_FLAG_WEAK = 0x0004;
-    private final static short ENTRY_FLAG_COMPACT = 0x0008;
-
-    private final static short TABLE_TYPE_FLAG_SPARSE = 0x01;
-    private final static short TABLE_TYPE_FLAG_OFFSET16 = 0x02;
-
-    private static final int KNOWN_CONFIG_BYTES = 64;
-
-    private static final int NO_ENTRY = 0xFFFFFFFF;
-    private static final int NO_ENTRY_OFFSET16 = 0xFFFF;
-
-    private static final Logger LOGGER = Logger.getLogger(ARSCDecoder.class.getName());
 }
