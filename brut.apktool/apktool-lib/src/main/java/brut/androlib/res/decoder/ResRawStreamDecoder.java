@@ -22,9 +22,9 @@ import org.apache.commons.io.IOUtils;
 import java.io.*;
 
 public class ResRawStreamDecoder implements ResStreamDecoder {
+
     @Override
-    public void decode(InputStream in, OutputStream out)
-            throws AndrolibException {
+    public void decode(InputStream in, OutputStream out) throws AndrolibException {
         try {
             IOUtils.copy(in, out);
         } catch (IOException ex) {

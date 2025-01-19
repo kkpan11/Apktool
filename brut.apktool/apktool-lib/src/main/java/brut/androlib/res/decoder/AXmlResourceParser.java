@@ -29,8 +29,7 @@ import brut.androlib.res.data.axml.NamespaceStack;
 import brut.androlib.res.data.value.ResAttr;
 import brut.androlib.res.data.value.ResScalarValue;
 import brut.androlib.res.xml.ResXmlEncoders;
-import brut.util.ExtCountingDataInput;
-import com.google.common.io.LittleEndianDataInputStream;
+import brut.util.ExtDataInputStream;
 import org.xmlpull.v1.XmlPullParserException;
 
 import java.io.*;
@@ -47,9 +46,45 @@ import java.util.logging.Logger;
  * this state methods return invalid values or throw exceptions.
  */
 public class AXmlResourceParser implements XmlResourceParser {
+    private static final Logger LOGGER = Logger.getLogger(AXmlResourceParser.class.getName());
+
+    private static final String E_NOT_SUPPORTED = "Method is not supported.";
+    private static final String ANDROID_RES_NS_AUTO = "http://schemas.android.com/apk/res-auto";
+    public static final String ANDROID_RES_NS = "http://schemas.android.com/apk/res/android";
+
+    // ResXMLTree_attribute
+    private static final int ATTRIBUTE_IX_NAMESPACE_URI = 0; // ns
+    private static final int ATTRIBUTE_IX_NAME = 1; // name
+    private static final int ATTRIBUTE_IX_VALUE_STRING = 2; // rawValue
+    private static final int ATTRIBUTE_IX_VALUE_TYPE = 3; // (size/res0/dataType)
+    private static final int ATTRIBUTE_IX_VALUE_DATA = 4; // data
+    private static final int ATTRIBUTE_LENGTH = 5;
+
+    private static final int PRIVATE_PKG_ID = 0x7F;
+
+    private final ResTable mResTable;
+    private final NamespaceStack mNamespaces;
+
+    private boolean mIsOperational;
+    private ExtDataInputStream mIn;
+    private StringBlock mStringBlock;
+    private int[] mResourceIds;
+    private boolean mDecreaseDepth;
+    private AndrolibException mFirstError;
+
+    // All values are essentially indices, e.g. mNameIndex is an index of name in mStringBlock.
+    private int mEvent;
+    private int mLineNumber;
+    private int mNameIndex;
+    private int mNamespaceIndex;
+    private int[] mAttributes;
+    private int mIdIndex;
+    private int mClassIndex;
+    private int mStyleIndex;
 
     public AXmlResourceParser(ResTable resTable) {
         mResTable = resTable;
+        mNamespaces = new NamespaceStack();
         resetEventInfo();
     }
 
@@ -64,16 +99,16 @@ public class AXmlResourceParser implements XmlResourceParser {
     public void open(InputStream stream) {
         close();
         if (stream != null) {
-            mIn = new ExtCountingDataInput(new LittleEndianDataInputStream(stream));
+            mIn = ExtDataInputStream.littleEndian(stream);
         }
     }
 
     @Override
     public void close() {
-        if (!isOperational) {
+        if (!mIsOperational) {
             return;
         }
-        isOperational = false;
+        mIsOperational = false;
         mIn = null;
         mStringBlock = null;
         mResourceIds = null;
@@ -89,9 +124,9 @@ public class AXmlResourceParser implements XmlResourceParser {
         try {
             doNext();
             return mEvent;
-        } catch (IOException e) {
+        } catch (IOException ex) {
             close();
-            throw e;
+            throw ex;
         }
     }
 
@@ -276,7 +311,7 @@ public class AXmlResourceParser implements XmlResourceParser {
         // we can resolve it to the default namespace. This may prove to be too aggressive as we scope the entire
         // system namespace, but it is better than not resolving it at all.
         ResID resId = new ResID(getAttributeNameResource(index));
-        if (namespace == -1 && resId.pkgId == 1) {
+        if (namespace == -1 && resId.getPackageId() == 1) {
             return ANDROID_RES_NS;
         }
 
@@ -289,7 +324,7 @@ public class AXmlResourceParser implements XmlResourceParser {
         String value = mStringBlock.getString(namespace);
 
         if (value == null || value.isEmpty()) {
-            if (resId.pkgId == PRIVATE_PKG_ID) {
+            if (resId.getPackageId() == PRIVATE_PKG_ID) {
                 return getNonDefaultNamespaceUri(offset);
             } else {
                 return ANDROID_RES_NS;
@@ -314,17 +349,16 @@ public class AXmlResourceParser implements XmlResourceParser {
 
     private String getNonDefaultNamespaceUri(int offset) {
         String prefix = mStringBlock.getString(mNamespaces.getPrefix(offset));
-        if (prefix != null) {
-            return  mStringBlock.getString(mNamespaces.getUri(offset));
+        if (prefix == null) {
+            // If we are here. There is some clever obfuscation going on. Our reference points to the namespace are gone.
+            // Normally we could take the index * attributeCount to get an offset.
+            // That would point to the URI in the StringBlock table, but that is empty.
+            // We have the namespaces that can't be touched in the opening tag.
+            // Though no known way to correlate them at this time.
+            // So return the res-auto namespace.
+            return ANDROID_RES_NS_AUTO;
         }
-
-        // If we are here. There is some clever obfuscation going on. Our reference points to the namespace are gone.
-        // Normally we could take the index * attributeCount to get an offset.
-        // That would point to the URI in the StringBlock table, but that is empty.
-        // We have the namespaces that can't be touched in the opening tag.
-        // Though no known way to correlate them at this time.
-        // So return the res-auto namespace.
-        return ANDROID_RES_NS_AUTO;
+        return mStringBlock.getString(mNamespaces.getUri(offset));
     }
 
     @Override
@@ -348,10 +382,10 @@ public class AXmlResourceParser implements XmlResourceParser {
 
         String resourceMapValue;
         String stringBlockValue = mStringBlock.getString(name);
-        int resourceId = getAttributeNameResource(index);
+        int attrResId = getAttributeNameResource(index);
 
         try {
-            resourceMapValue = decodeFromResourceId(resourceId);
+            resourceMapValue = decodeFromResourceId(attrResId);
         } catch (AndrolibException ignored) {
             resourceMapValue = null;
         }
@@ -371,7 +405,7 @@ public class AXmlResourceParser implements XmlResourceParser {
         }
 
         // In this case we have a bogus resource. If it was not found in either.
-        return "APKTOOL_MISSING_" + Integer.toHexString(resourceId);
+        return "APKTOOL_MISSING_" + Integer.toHexString(attrResId);
     }
 
     @Override
@@ -404,13 +438,16 @@ public class AXmlResourceParser implements XmlResourceParser {
         int valueRaw = mAttributes[offset + ATTRIBUTE_IX_VALUE_STRING];
 
         try {
-            String stringBlockValue = valueRaw == -1 ? null : ResXmlEncoders.escapeXmlChars(mStringBlock.getString(valueRaw));
+            String stringBlockValue = valueRaw != -1
+                ? ResXmlEncoders.escapeXmlChars(mStringBlock.getString(valueRaw)) : null;
             String resourceMapValue = null;
 
             // Ensure we only track down obfuscated values for reference/attribute type values. Otherwise, we might
             // spam lookups against resource table for invalid ids.
-            if (valueType == TypedValue.TYPE_REFERENCE || valueType == TypedValue.TYPE_DYNAMIC_REFERENCE ||
-                valueType == TypedValue.TYPE_ATTRIBUTE || valueType == TypedValue.TYPE_DYNAMIC_ATTRIBUTE) {
+            if (valueType == TypedValue.TYPE_REFERENCE
+                    || valueType == TypedValue.TYPE_DYNAMIC_REFERENCE
+                    || valueType == TypedValue.TYPE_ATTRIBUTE
+                    || valueType == TypedValue.TYPE_DYNAMIC_ATTRIBUTE) {
                 resourceMapValue = decodeFromResourceId(valueData);
             }
             String value = getPreferredString(stringBlockValue, resourceMapValue);
@@ -451,21 +488,20 @@ public class AXmlResourceParser implements XmlResourceParser {
     public float getAttributeFloatValue(int index, float defaultValue) {
         int offset = getAttributeOffset(index);
         int valueType = mAttributes[offset + ATTRIBUTE_IX_VALUE_TYPE];
-        if (valueType == TypedValue.TYPE_FLOAT) {
-            int valueData = mAttributes[offset + ATTRIBUTE_IX_VALUE_DATA];
-            return Float.intBitsToFloat(valueData);
+        if (valueType != TypedValue.TYPE_FLOAT) {
+            return defaultValue;
         }
-        return defaultValue;
+        return Float.intBitsToFloat(mAttributes[offset + ATTRIBUTE_IX_VALUE_DATA]);
     }
 
     @Override
     public int getAttributeIntValue(int index, int defaultValue) {
         int offset = getAttributeOffset(index);
         int valueType = mAttributes[offset + ATTRIBUTE_IX_VALUE_TYPE];
-        if (valueType >= TypedValue.TYPE_FIRST_INT && valueType <= TypedValue.TYPE_LAST_INT) {
-            return mAttributes[offset + ATTRIBUTE_IX_VALUE_DATA];
+        if (valueType < TypedValue.TYPE_FIRST_INT || valueType > TypedValue.TYPE_LAST_INT) {
+            return defaultValue;
         }
-        return defaultValue;
+        return mAttributes[offset + ATTRIBUTE_IX_VALUE_DATA];
     }
 
     @Override
@@ -477,10 +513,10 @@ public class AXmlResourceParser implements XmlResourceParser {
     public int getAttributeResourceValue(int index, int defaultValue) {
         int offset = getAttributeOffset(index);
         int valueType = mAttributes[offset + ATTRIBUTE_IX_VALUE_TYPE];
-        if (valueType == TypedValue.TYPE_REFERENCE) {
-            return mAttributes[offset + ATTRIBUTE_IX_VALUE_DATA];
+        if (valueType != TypedValue.TYPE_REFERENCE) {
+            return defaultValue;
         }
-        return defaultValue;
+        return mAttributes[offset + ATTRIBUTE_IX_VALUE_DATA];
     }
 
     @Override
@@ -609,12 +645,12 @@ public class AXmlResourceParser implements XmlResourceParser {
     }
 
     @Override
-    public boolean getFeature(String feature) {
+    public boolean getFeature(String name) {
         return false;
     }
 
     @Override
-    public void setFeature(String name, boolean value) throws XmlPullParserException {
+    public void setFeature(String name, boolean state) throws XmlPullParserException {
         throw new XmlPullParserException(E_NOT_SUPPORTED);
     }
 
@@ -637,12 +673,14 @@ public class AXmlResourceParser implements XmlResourceParser {
         if (name == -1) {
             return -1;
         }
-        int uri = (namespace != null) ? mStringBlock.find(namespace) : -1;
-        for (int o = 0; o != mAttributes.length; o += ATTRIBUTE_LENGTH) {
-            if (name == mAttributes[o + ATTRIBUTE_IX_NAME]
-                    && (uri == -1 || uri == mAttributes[o + ATTRIBUTE_IX_NAMESPACE_URI])) {
-                return o / ATTRIBUTE_LENGTH;
+        int uri = namespace != null ? mStringBlock.find(namespace) : -1;
+        int offset = 0;
+        while (offset < mAttributes.length) {
+            if (name == mAttributes[offset + ATTRIBUTE_IX_NAME]
+                    && (uri == -1 || uri == mAttributes[offset + ATTRIBUTE_IX_NAMESPACE_URI])) {
+                return offset / ATTRIBUTE_LENGTH;
             }
+            offset += ATTRIBUTE_LENGTH;
         }
         return -1;
     }
@@ -660,7 +698,7 @@ public class AXmlResourceParser implements XmlResourceParser {
                     String type = stringBlockValue.substring(0, slashPos);
                     value = type + "/" + resourceMapValue;
                 }
-            } else if (! stringBlockValue.equals(resourceMapValue)) {
+            } else if (!stringBlockValue.equals(resourceMapValue)) {
                 value = resourceMapValue;
             }
         }
@@ -685,7 +723,7 @@ public class AXmlResourceParser implements XmlResourceParser {
 
             mStringBlock = StringBlock.readWithChunk(mIn);
             mNamespaces.increaseDepth();
-            isOperational = true;
+            mIsOperational = true;
         }
 
         if (mEvent == END_DOCUMENT) {
@@ -696,8 +734,8 @@ public class AXmlResourceParser implements XmlResourceParser {
         resetEventInfo();
 
         while (true) {
-            if (m_decreaseDepth) {
-                m_decreaseDepth = false;
+            if (mDecreaseDepth) {
+                mDecreaseDepth = false;
                 mNamespaces.decreaseDepth();
             }
 
@@ -708,7 +746,7 @@ public class AXmlResourceParser implements XmlResourceParser {
             }
 
             // #2070 - Some applications have 2 start namespaces, but only 1 end namespace.
-            if (mIn.remaining() == 0) {
+            if (mIn.available() == 0) {
                 LOGGER.warning(String.format("AXML hit unexpected end of file at byte: 0x%X", mIn.position()));
                 mEvent = END_DOCUMENT;
                 break;
@@ -772,7 +810,6 @@ public class AXmlResourceParser implements XmlResourceParser {
                 continue;
             }
 
-
             if (chunkType == ARSCHeader.RES_XML_START_ELEMENT_TYPE) {
                 mNamespaceIndex = mIn.readInt();
                 mNameIndex = mIn.readInt();
@@ -807,7 +844,7 @@ public class AXmlResourceParser implements XmlResourceParser {
                 mNamespaceIndex = mIn.readInt();
                 mNameIndex = mIn.readInt();
                 mEvent = END_TAG;
-                m_decreaseDepth = true;
+                mDecreaseDepth = true;
                 break;
             }
 
@@ -826,40 +863,4 @@ public class AXmlResourceParser implements XmlResourceParser {
             mFirstError = error;
         }
     }
-
-    private ExtCountingDataInput mIn;
-    private final ResTable mResTable;
-    private AndrolibException mFirstError;
-
-    private boolean isOperational = false;
-    private StringBlock mStringBlock;
-    private int[] mResourceIds;
-    private final NamespaceStack mNamespaces = new NamespaceStack();
-    private boolean m_decreaseDepth;
-
-    // All values are essentially indices, e.g. mNameIndex is an index of name in mStringBlock.
-    private int mEvent;
-    private int mLineNumber;
-    private int mNameIndex;
-    private int mNamespaceIndex;
-    private int[] mAttributes;
-    private int mIdIndex;
-    private int mClassIndex;
-    private int mStyleIndex;
-
-    private final static Logger LOGGER = Logger.getLogger(AXmlResourceParser.class.getName());
-    private static final String E_NOT_SUPPORTED = "Method is not supported.";
-
-    // ResXMLTree_attribute
-    private static final int ATTRIBUTE_IX_NAMESPACE_URI = 0; // ns
-    private static final int ATTRIBUTE_IX_NAME = 1; // name
-    private static final int ATTRIBUTE_IX_VALUE_STRING = 2; // rawValue
-    private static final int ATTRIBUTE_IX_VALUE_TYPE = 3; // (size/res0/dataType)
-    private static final int ATTRIBUTE_IX_VALUE_DATA = 4; // data
-    private static final int ATTRIBUTE_LENGTH = 5;
-
-    private static final int PRIVATE_PKG_ID = 0x7F;
-
-    private static final String ANDROID_RES_NS_AUTO = "http://schemas.android.com/apk/res-auto";
-    private static final String ANDROID_RES_NS = "http://schemas.android.com/apk/res/android";
 }
